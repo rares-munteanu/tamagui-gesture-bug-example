@@ -1,0 +1,42 @@
+diff --git a/node_modules/@tamagui/native/dist/esm/gestureState.native.js b/node_modules/@tamagui/native/dist/esm/gestureState.native.js
+index 439763f..60ba7a4 100644
+--- a/node_modules/@tamagui/native/dist/esm/gestureState.native.js
++++ b/node_modules/@tamagui/native/dist/esm/gestureState.native.js
+@@ -49,6 +49,7 @@ var pressState = {
+   ownerId: null,
+   ownerSource: null,
+   ownerPointerId: null,
++  ownerDepth: -1,
+   timestamp: 0
+ };
+ function resetPressOwner() {
+@@ -56,6 +57,7 @@ function resetPressOwner() {
+   pressState.ownerId = null;
+   pressState.ownerSource = null;
+   pressState.ownerPointerId = null;
++  pressState.ownerDepth = -1;
+   pressState.timestamp = 0;
+ }
+ function resetStaleOwner(now, debugName) {
+@@ -109,6 +111,7 @@ function getGestureHandler() {
+       var longPressDuration = (_config_delayLongPress = config.delayLongPress) !== null && _config_delayLongPress !== void 0 ? _config_delayLongPress : 500;
+       var myToken = {};
+       var myDebugId = ++pressGestureDebugId;
++      var depth = config.depth != null ? config.depth : 0;
+       var flags = {
+         didLongPress: false,
+         didPressIn: false,
+@@ -125,11 +128,12 @@ function getGestureHandler() {
+         resetStaleOwner(now, config.debugName);
+         var currentPointerId = getEventPointerId(e);
+         var isSameTouchPointer = currentPointerId == null || pressState.ownerPointerId == null || pressState.ownerPointerId === currentPointerId;
+-        if (pressState.owner === null || pressState.ownerSource === "internal" && isSameTouchPointer) {
++        if (pressState.owner === null || pressState.ownerSource === "internal" && isSameTouchPointer && depth > pressState.ownerDepth) {
+           pressState.owner = myToken;
+           pressState.ownerId = myDebugId;
+           pressState.ownerSource = "internal";
+           pressState.ownerPointerId = currentPointerId;
++          pressState.ownerDepth = depth;
+           pressState.timestamp = now;
+         }
+         return pressState.owner === myToken;
