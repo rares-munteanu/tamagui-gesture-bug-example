@@ -1,6 +1,6 @@
 # Tamagui: a `Sheet.Frame` with `onPress` steals the press from buttons inside it (`pressEvents: true`)
 
-This repo reproduces a bug in `tamagui@2.1.0`: with `setupGestureHandler({ pressEvents: true })` (the RNGH press path), a Tamagui pressable that **wraps** another Tamagui pressable can steal the press. Here a `Sheet.Frame` with `onPress`/`onPressIn` wraps a `Button` (`styled(View)` with `onPress`) inside the sheet: tapping the inner button intermittently fires the **frame's** `onPress` instead of the button's, so the button's own `onPress` does not run. It is a **race condition**, so it does not happen on every tap (see "Why it's intermittent").
+This repo reproduces a bug in `tamagui@2.1.0`: with `setupGestureHandler({ pressEvents: true })` (the RNGH press path), a Tamagui pressable that **wraps** another Tamagui pressable can steal the press. Here a `Sheet.Frame` with `onPress`/`onPressIn` wraps a `Button` (`styled(View)` with `onPress`) inside the sheet: tapping the inner button can fire the **frame's** `onPress` instead of the button's, so the button's own `onPress` does not run. It is a **mount-time race**: in a given app session the bug is either fully present (the button is stolen on **every** tap) or fully absent (it works on every tap) - reloading the app re-rolls it (see "Why it's intermittent").
 
 This is the opposite of what the code says it does. `@tamagui/native/src/gestureState.ts:113-116`:
 
@@ -46,21 +46,23 @@ Steps: tap **Open sheet**, then tap the **Press me** button inside the sheet.
 
 ## Actual behavior
 
-Intermittently, tapping the inner button logs `Frame pressed` (and `Frame pressed in`) instead of `Inner button pressed` - the frame stole the press. This is **not deterministic**: across taps and app restarts it flips between the button working and the frame stealing (see "Why it's intermittent" below).
+When the bug is present in a session, **every** tap on the inner button logs `Frame pressed` (and `Frame pressed in`) and `Inner button pressed` never fires - re-tapping does not help. The state is fixed for the whole session: reload the app and it may instead work on every tap. See "Why it's intermittent" below.
 
 ## Expected behavior
 
 Tapping the inner button always logs `Inner button pressed`. The innermost pressable should win, matching the RN responder system and Tamagui's own stated intent. Tapping the frame *outside* the button logs `Frame pressed`.
 
-## Why it's intermittent (a race condition)
+## Why it's intermittent (a mount-time race)
 
-The outcome flips run-to-run because the press winner is decided by a race with no tie-breaker. Each Tamagui press is a `Gesture.Tap().runOnJS(true)` (`gestureState.ts:321-322`), so the `onBegin` that claims ownership runs on the **JS thread**, dispatched asynchronously from the native gesture thread. Tapping the inner button fires `onBegin` on **both** the frame's and the button's Tap; each calls `tryClaimOwnership`. The reclaim rule (`:266-267`) lets any same-pointer internal gesture overwrite the current owner unconditionally - **no tie-breaker** - so ownership goes to whichever `onBegin` runs **last**, and `onEnd` (`:356-359`) fires `onPress` only for that owner.
+The bug is **all-or-nothing per app session**, not per tap. Within one mount the inner button is either stolen on **every** tap or works on **every** tap - re-tapping never changes it; you have to **reload the app** to re-roll. So the race is at gesture setup (mount) time, not a per-tap timing race.
 
-Neither RNGH's nested `onBegin` delivery order nor the JS-thread dispatch timing is guaranteed. The code hard-codes the assumption that RNGH "fires parent before child" (`:248`) and adds a 24ms grace window (`:251`) so the child can reclaim. When that assumption holds, the button wins; when it doesn't, the frame wins. The deterministic proof is the source itself - correctness depends on an unguaranteed ordering - and the depth-aware fix removes the race by deciding ownership from nesting depth instead of arrival order.
+Each Tamagui press is a `Gesture.Tap()` (`gestureState.ts:321`). On `onBegin` it claims a single shared global owner via `tryClaimOwnership`; the reclaim rule (`:266-267`) has **no tie-breaker**, so the owner is simply whichever of the two nested gestures (frame, button) runs its `onBegin` **last**, and `onEnd` (`:356-359`) fires `onPress` only for that owner. Ownership is released on every finalize (`onFinalize` -> `releaseOwnership`, `:362-365`, `:280-288`), so **each tap re-runs the claim from scratch** - yet within a session the *same* gesture wins every time. That can only mean the `onBegin` order of the two gestures is itself fixed for the session: established at gesture setup (mount) and re-rolled only on reload (gesture handler identities are assigned at creation, `getNextHandlerTag`). The code even hard-codes the assumption that this order is "parent before child" (`:248`) and adds a 24ms grace window (`:251`) so the child can reclaim: sessions that mount in that order work, sessions that mount in the opposite order steal on every tap.
+
+So with no tie-breaker, which press wins comes down entirely to an ordering that isn't guaranteed. The depth-aware fix removes that dependence: ownership is decided by nesting depth, so the innermost wins on every tap in every session, regardless of registration order.
 
 ## Impact
 
-This is not specific to the Sheet - it affects any nested Tamagui press pair under `pressEvents: true`. The same defect makes a tappable card swallow taps on its own "..." menu button, etc. The `Sheet.Frame` case is just the clearest reproduction.
+This is not specific to the Sheet - it affects any nested Tamagui press pair under `pressEvents: true`. The same defect makes a tappable card swallow taps on its own "..." menu button. The `Sheet.Frame` case is just the clearest reproduction.
 
 ## Why this is a Tamagui issue, not an RNGH one
 
@@ -107,9 +109,7 @@ Full patch (two files):
 - `patches/@tamagui+native+2.1.0.patch` - the ownership rule (`gestureState`).
 - `patches/@tamagui+web+2.1.0.patch` - the depth plumbing (`createComponent` + `eventHandling.native`).
 
-A one-line "first claim wins" variant (drop the same-pointer reclaim entirely) was rejected: it only equals innermost-wins if RNGH delivers the child's `onBegin` first, which is exactly the assumption that is already wrong here, so it is order-dependent and risks regressing the intended child-steals-parent case. The depth approach is order-independent.
-
-Tested with `pressEvents: true`: with the patch applied, tapping the inner button fires the button's `onPress` - the ancestor no longer steals it. (The same patch also restores a real-world case where a tappable card was swallowing taps on its own "..." menu button.) By construction the fix is order-independent: it compares nesting depth, not `onBegin` arrival order. A single pressable is unaffected (nothing competes for ownership), and a non-pressable view does not change depth (the increment is gated on `hasRealPressEvents`).
+Tested with `pressEvents: true`: with the patch applied, tapping the inner button fires the button's `onPress` and the frame no longer steals it. It also fixes a real app where a tappable card was swallowing taps on its own "..." menu button. Because ownership is decided by depth rather than `onBegin` arrival order, the inner button wins in every session, regardless of how the gestures registered at mount.
 
 ## Notes
 
