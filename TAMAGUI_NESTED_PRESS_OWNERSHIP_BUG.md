@@ -1,8 +1,8 @@
-# Tamagui: a parent press steals the press from a nested child (`pressEvents: true` RNGH path)
+# Tamagui: a `Sheet.Frame` with `onPress` steals the press from buttons inside it (`pressEvents: true`)
 
-This repo reproduces a bug in `tamagui@2.1.0`: with `setupGestureHandler({ pressEvents: true })` (the RNGH press path, the default on native), a Tamagui pressable that **wraps** another Tamagui pressable steals the press. Tapping the inner (descendant) pressable fires the **outer** (ancestor)'s `onPress`; the inner's `onPress` never runs.
+This repo reproduces a bug in `tamagui@2.1.0`: with `setupGestureHandler({ pressEvents: true })` (the RNGH press path), a Tamagui pressable that **wraps** another Tamagui pressable can steal the press. Here a `Sheet.Frame` with `onPress`/`onPressIn` wraps a `Button` (`styled(View)` with `onPress`) inside the sheet: tapping the inner button intermittently fires the **frame's** `onPress` instead of the button's, so the button's own `onPress` does not run. It is a **race condition**, so it does not happen on every tap (see "Why it's intermittent").
 
-This is the exact opposite of what the code says it does. `@tamagui/native/src/gestureState.ts:113-116`:
+This is the opposite of what the code says it does. `@tamagui/native/src/gestureState.ts:113-116`:
 
 ```
 Global press coordination - ensures only innermost pressable fires press events,
@@ -12,42 +12,55 @@ matching RN Pressable/responder system semantics where deepest component wins.
 
 ## Reproduction
 
-Minimal - two nested `styled(View)` pressables, no Sheet required.
+`setupGestureHandler({ pressEvents: true, sheet: true })` runs in the root layout before `<TamaguiProvider>` mounts. See [`src/app/_layout.tsx`](src/app/_layout.tsx) and [`src/app/index.tsx`](src/app/index.tsx). The essential structure:
 
 ```tsx
-// src/app/_layout.tsx  (runs before <TamaguiProvider> mounts)
+// src/app/_layout.tsx
 import { setupGestureHandler } from '@tamagui/native/setup-gesture-handler'
-setupGestureHandler({ pressEvents: true })
+setupGestureHandler({ pressEvents: true, sheet: true })
+// <GestureHandlerRootView> <TamaguiProvider> <Stack/> ...
 ```
 
 ```tsx
 // src/app/index.tsx
-import { styled, Text, View } from 'tamagui'
+const Button = styled(View, { /* ...size, pressStyle... */ })
 
-const Box = styled(View, { padding: 24 })
-
-export default function Index() {
-  return (
-    <Box onPress={() => console.log('OUTER pressed')}>
-      <Box onPress={() => console.log('INNER pressed')}>
-        <Text>tap me</Text>
-      </Box>
-    </Box>
-  )
-}
+<Sheet open={open} onOpenChange={...} snapPoints={[70]} snapPointsMode="percent" dismissOnSnapToBottom dismissOnOverlayPress>
+  <Sheet.Overlay ... />
+  <Sheet.Frame
+    onPressIn={() => console.log('Frame pressed in')}
+    onPress={() => console.log('Frame pressed')}
+  >
+    <Sheet.ScrollView>
+      <SheetContainer>
+        <Button onPress={() => console.log('Inner button pressed')}>
+          <Text>Press me</Text>
+        </Button>
+      </SheetContainer>
+    </Sheet.ScrollView>
+  </Sheet.Frame>
+</Sheet>
 ```
 
-Tap the inner box (over "tap me").
+Steps: tap **Open sheet**, then tap the **Press me** button inside the sheet.
 
 ## Actual behavior
 
-Console logs `OUTER pressed`. The inner box's `onPress` never fires - the ancestor stole the press.
+Intermittently, tapping the inner button logs `Frame pressed` (and `Frame pressed in`) instead of `Inner button pressed` - the frame stole the press. This is **not deterministic**: across taps and app restarts it flips between the button working and the frame stealing (see "Why it's intermittent" below).
 
 ## Expected behavior
 
-Console logs `INNER pressed`. The innermost pressable should win (matching the RN responder system, and Tamagui's own stated intent). Tapping the outer box *outside* the inner box should fire `OUTER pressed`.
+Tapping the inner button always logs `Inner button pressed`. The innermost pressable should win, matching the RN responder system and Tamagui's own stated intent. Tapping the frame *outside* the button logs `Frame pressed`.
 
-The same defect makes a `Sheet.Frame` with `onPress`/`onPressIn` swallow taps on any button inside the sheet, and a tappable card swallow taps on its own "..." menu button. It is not Sheet- or card-specific: any nested Tamagui press pair under `pressEvents: true` hits it.
+## Why it's intermittent (a race condition)
+
+The outcome flips run-to-run because the press winner is decided by a race with no tie-breaker. Each Tamagui press is a `Gesture.Tap().runOnJS(true)` (`gestureState.ts:321-322`), so the `onBegin` that claims ownership runs on the **JS thread**, dispatched asynchronously from the native gesture thread. Tapping the inner button fires `onBegin` on **both** the frame's and the button's Tap; each calls `tryClaimOwnership`. The reclaim rule (`:266-267`) lets any same-pointer internal gesture overwrite the current owner unconditionally - **no tie-breaker** - so ownership goes to whichever `onBegin` runs **last**, and `onEnd` (`:356-359`) fires `onPress` only for that owner.
+
+Neither RNGH's nested `onBegin` delivery order nor the JS-thread dispatch timing is guaranteed. The code hard-codes the assumption that RNGH "fires parent before child" (`:248`) and adds a 24ms grace window (`:251`) so the child can reclaim. When that assumption holds, the button wins; when it doesn't, the frame wins. The deterministic proof is the source itself - correctness depends on an unguaranteed ordering - and the depth-aware fix removes the race by deciding ownership from nesting depth instead of arrival order.
+
+## Impact
+
+This is not specific to the Sheet - it affects any nested Tamagui press pair under `pressEvents: true`. The same defect makes a tappable card swallow taps on its own "..." menu button, etc. The `Sheet.Frame` case is just the clearest reproduction.
 
 ## Why this is a Tamagui issue, not an RNGH one
 
@@ -78,7 +91,7 @@ Any internal gesture on the same finger may **overwrite** the current internal o
 // RNGH fires parent before child, but we want innermost to win.
 ```
 
-For two nested Tamagui press gestures (each in its own `GestureDetector`), that assumption is inverted: the **ancestor** reclaims last, so it becomes the owner. The descendant's `onEnd` then sees `isOwner() === false` and its `onPress` never runs.
+For two nested Tamagui press gestures (the `Sheet.Frame` and the `Button`, each in its own `GestureDetector`), that assumption is inverted: the **ancestor** (frame) reclaims last, so it becomes the owner. The button's `onEnd` then sees `isOwner() === false` and its `onPress` never runs.
 
 Net: the documented "innermost/deepest wins" becomes "outermost wins" for nested presses.
 
@@ -96,9 +109,9 @@ Full patch (two files):
 
 A one-line "first claim wins" variant (drop the same-pointer reclaim entirely) was rejected: it only equals innermost-wins if RNGH delivers the child's `onBegin` first, which is exactly the assumption that is already wrong here, so it is order-dependent and risks regressing the intended child-steals-parent case. The depth approach is order-independent.
 
-Verified on iOS and Android with `pressEvents: true`: tapping the inner pressable fires the inner `onPress`; tapping the outer (outside the inner) fires the outer; a single pressable is unchanged; a decorative non-press view between two pressables does not shift the winner.
+Tested with `pressEvents: true`: with the patch applied, tapping the inner button fires the button's `onPress` - the ancestor no longer steals it. (The same patch also restores a real-world case where a tappable card was swallowing taps on its own "..." menu button.) By construction the fix is order-independent: it compares nesting depth, not `onBegin` arrival order. A single pressable is unaffected (nothing competes for ownership), and a non-pressable view does not change depth (the increment is gated on `hasRealPressEvents`).
 
 ## Notes
 
-- Platforms: native (iOS + Android). Web is unaffected - Tamagui maps web presses to `onClick`, which bubbles normally; the `pressState` ownership path is native-only.
+- Platforms: native only (`pressEvents: true`). Web is unaffected - Tamagui maps web presses to `onClick`, which bubbles normally; the `pressState` ownership path is native-only. The steal happens because the ancestor's press gesture reclaims ownership **last** (its `onBegin` runs after the descendant's) - the opposite of what the code assumes at line 248 ("RNGH fires parent before child"). Whether a given platform/RNGH version delivers nested `onBegin` in that order is what determines if the steal is visible; the depth-aware fix removes that dependency entirely.
 - Dev gotcha: the per-component press state latches (`hasHadEvents` / `gestureRef` never reset in `@tamagui/web/src/eventHandling.native.ts`), so removing an `onPress` and Fast-Refreshing does not clear the stale gesture - a full reload is required to see the effect of adding/removing a handler.
